@@ -42,8 +42,8 @@ class SACConfig(ConfigBase):
         self.adam_epsilon = 1e-8
         self.dist_type = "gaussian"
         self.hidden_size = 256
-        self.memory_size = 10240
-        self.batch_size = 32
+        self.memory_size = 500000
+        self.batch_size = 2048
         # self.mini_batch_size = 32
         self.mini_epoch = 1
         self.initial_temperature = 0.01

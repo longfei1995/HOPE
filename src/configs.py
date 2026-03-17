@@ -117,7 +117,7 @@ N_DISCRETE_ACTION = len(discrete_actions)
 #########################
 # model
 GAMMA = 0.98
-BATCH_SIZE = 8192
+BATCH_SIZE = 65536
 LR = 5e-6
 TAU = 0.1
 MAX_TRAIN_STEP = 1e6

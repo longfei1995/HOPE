@@ -24,7 +24,7 @@ class PPOConfig(ConfigBase):
         self.dist_type = "gaussian"
         self.hidden_size = 256
         self.mini_epoch = 10
-        self.mini_batch = 32
+        self.mini_batch = 2048
 
         self.clip_epsilon = 0.2
         self.lambda_ = 0.95
