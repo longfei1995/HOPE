@@ -24,9 +24,9 @@ VehicleBox = LinearRing([
     (-REAR_HANG,  WIDTH/2)])
 
 COLOR_POOL = [
-    (30, 144, 255, 255), # dodger blue
-    (255, 127, 80, 255), # coral
-    (255, 215, 0, 255) # gold
+    (30, 144, 255, 255), # 宝蓝
+    (255, 127, 80, 255), # 珊瑚
+    (255, 215, 0, 255) # 金色
 ]
 
 VALID_SPEED = [-2.5, 2.5]
@@ -34,11 +34,11 @@ VALID_STEER = [-0.75, 0.75]
 VALID_ACCEL = [-1.0, 1.0]
 VALID_ANGULAR_SPEED = [-0.5, 0.5]
 
-NUM_STEP = 10
-STEP_LENGTH = 5e-2
+NUM_STEP = 10               # 物理仿真每次更新状态的步数（每步 0.05s，10 步即 0.5s 更新一次渲染和决策）
+STEP_LENGTH = 5e-2          # 每步的仿真时间长度（秒）
 
 ########################
-# senerio
+# scenario
 MAP_LEVEL = 'Normal' # ['Normal', 'Complex', 'Extrem', 'dlp']
 MIN_PARK_LOT_LEN_DICT = {'Extrem':LENGTH+0.6,
                             'Complex':LENGTH+0.9,

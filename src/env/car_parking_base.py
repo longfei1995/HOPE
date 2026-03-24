@@ -1,5 +1,13 @@
 '''
-This is a collision-free env which only includes one parking case with random start position.
+CarParking 环境核心实现。
+
+定位：
+1) 这是底层 Gym 环境，负责物理推进、碰撞检测、到达判定、奖励计算与渲染。
+2) 训练脚本通常通过 env_wrapper 与该类交互，但真实逻辑都在这里。
+
+说明：
+- 该环境的 step 第 3 个返回值是 Status 枚举，而不是布尔 done。
+- 上层 Wrapper 会将 Status 转换为算法使用的 done/terminated 语义。
 '''
 
 
@@ -56,10 +64,13 @@ class CarParking(gym.Env):
     ):
         super().__init__()
 
+        # 运行与观测开关
         self.verbose = verbose
         self.use_lidar_observation = use_lidar_observation
         self.use_img_observation = use_img_observation
         self.use_action_mask = use_action_mask
+
+        # 渲染控制
         self.render_mode = "human" if render_mode is None else render_mode
         self.fps = fps
         self.screen: Optional[pygame.Surface] = None
@@ -69,14 +80,20 @@ class CarParking(gym.Env):
         self.t = 0.0
         self.k = None
         self.level = MAP_LEVEL
-        self.tgt_repr_size = 5 # relative_distance, cos(theta), sin(theta), cos(phi), sin(phi)
+        # target 向量维度: [相对距离, cos(theta), sin(theta), cos(phi), sin(phi)]
+        self.tgt_repr_size = 5
 
+        # 根据难度级别选择地图生成器
         if self.level in ['Normal', 'Complex', 'Extrem']:
             self.map = ParkingMapNormal(self.level)
         elif self.level == 'dlp':
             self.map = ParkingMapDLP()
+
+        # 车辆、激光雷达仿真器
         self.vehicle = Vehicle(n_step=NUM_STEP, step_len=STEP_LENGTH)
         self.lidar = LidarSimlator(LIDAR_RANGE, LIDAR_NUM)
+
+        # 奖励相关状态（包含 box_union 的累计门控）
         self.reward = 0.0
         self.prev_reward = 0.0
         self.accum_arrive_reward = 0.0
@@ -84,8 +101,9 @@ class CarParking(gym.Env):
         self.action_space = spaces.Box(
             np.array([VALID_STEER[0], VALID_SPEED[0]]).astype(np.float32),
             np.array([VALID_STEER[1], VALID_SPEED[1]]).astype(np.float32),
-        ) # steer, speed
+        ) # 连续动作: [steer, speed]
        
+        # 观测空间是 Dict，按开关动态拼装
         self.observation_space = {}
         if self.use_action_mask:
             self.action_filter = ActionMask()
@@ -115,6 +133,7 @@ class CarParking(gym.Env):
         )
     
     def set_level(self, level:str=None):
+        # 动态切换场景难度；评估脚本会在多个 level 间切换
         if level is None:
             self.map = ParkingMapNormal()
             return
@@ -125,6 +144,7 @@ class CarParking(gym.Env):
             self.map = ParkingMapDLP()
 
     def reset(self, case_id: int = None, data_dir: str = None, level: str = None,) -> np.ndarray:
+        # 每个 episode 重置奖励累计与时间步
         self.reward = 0.0
         self.prev_reward = 0.0
         self.accum_arrive_reward = 0.0
@@ -132,14 +152,22 @@ class CarParking(gym.Env):
 
         if level is not None:
             self.set_level(level)
+
+        # map.reset 负责生成起点/终点/障碍；vehicle.reset 负责车辆状态归位
         initial_state = self.map.reset(case_id, data_dir)
         self.vehicle.reset(initial_state)
+
+        # 渲染坐标变换矩阵依赖当前地图边界，reset 后重算
         self.matrix = self.coord_transform_matrix()
+
+        # 复用 step(None) 构造初始观测，确保 reset 与 step 的观测流程一致
         return self.step()[0]
 
     def coord_transform_matrix(self) -> list:
         """Get the transform matrix that convert the real world coordinate to the pygame coordinate.
         """
+        # 仿真坐标 -> 画布坐标的仿射矩阵 [a,b,d,e,xoff,yoff]
+        # 其中这里只做等比缩放 + 平移，不做旋转/切变
         k = K
         bx = 0.5 * (WIN_W - k * (self.map.xmax + self.map.xmin))
         by = 0.5 * (WIN_H - k * (self.map.ymax + self.map.ymin))
@@ -151,17 +179,19 @@ class CarParking(gym.Env):
         return list(transformed.coords)
 
     def _detect_collision(self):
-        # return False
+        # 车辆包围盒与任一障碍相交则碰撞
         for obstacle in self.map.obstacles:
             if self.vehicle.box.intersects(obstacle.shape):
                 return True
         return False
     
     def _detect_outbound(self):
+        # 超出地图边界判定
         x, y = self.vehicle.state.loc.x, self.vehicle.state.loc.y
         return x>self.map.xmax or x<self.map.xmin or y>self.map.ymax or y<self.map.ymin
 
     def _check_arrived(self):
+        # 以车辆与目标车位区域重叠率作为到达标准（>95%）
         vehicle_box = Polygon(self.vehicle.box)
         dest_box = Polygon(self.map.dest_box)
         union_area = vehicle_box.intersection(dest_box).area
@@ -173,6 +203,8 @@ class CarParking(gym.Env):
         return self.t > TOLERANT_TIME
 
     def _check_status(self):
+        # 终止优先级：碰撞 > 越界 > 到达 > 超时 > 继续
+        # 顺序意味着同一步内若既碰撞又到达，会先记为碰撞。
         if self._detect_collision():
             return Status.COLLIDED
         if self._detect_outbound():
@@ -185,10 +217,11 @@ class CarParking(gym.Env):
 
     def _get_reward(self, prev_state: State, curr_state: State):
 
-        # time penalty
+        # 1) 时间惩罚：随时间递增，范围接近 (-1, 0)
         time_cost = - np.tanh(self.t / (10*TOLERANT_TIME))
 
-        # RS distance reward
+        # 2) RS 距离奖励：基于 Reeds-Shepp 最短路径长度的改变量
+        #    由 REWARD_WEIGHT['rs_dist_reward'] 控制是否启用
         if REWARD_WEIGHT['rs_dist_reward'] != 0:
             radius = math.tan(VALID_STEER[-1])/WHEEL_BASE
             curr_rs_dist = rsCurve.calc_optimal_path(*curr_state.get_pos(), *self.map.dest.get_pos(), radius , 0.1).L
@@ -199,7 +232,7 @@ class CarParking(gym.Env):
         else:
             rs_dist_reward = 0
 
-        # Euclidean distance reward & angle reward
+        # 3) 欧氏距离与朝向奖励：均使用“前后状态差分”
         def get_angle_diff(angle1, angle2):
             # norm to 0 ~ pi/2
             angle_dif = math.acos(math.cos(angle1 - angle2)) # 0~pi
@@ -213,7 +246,8 @@ class CarParking(gym.Env):
         dist_reward = prev_dist_diff/dist_norm_ratio - dist_diff/dist_norm_ratio
         angle_reward = prev_angle_diff/angle_norm_ratio - angle_diff/angle_norm_ratio
         
-        # Box union reward
+        # 4) Box IoU 风格奖励：鼓励车体逐步覆盖目标车位
+        #    这里使用累积门控，只有“比历史最好更好”时才给增量奖励，防抖动刷分。
         vehicle_box = Polygon(self.vehicle.box)
         dest_box = Polygon(self.map.dest_box)
         union_area = vehicle_box.intersection(dest_box).area
@@ -227,6 +261,7 @@ class CarParking(gym.Env):
         return [time_cost ,rs_dist_reward ,dist_reward ,angle_reward ,box_union_reward]
         
     def get_reward(self, status, prev_state):
+        # 仅在 CONTINUE 状态计算 shaped reward；终止状态奖励由上层策略处理
         reward_info = [0,0,0,0,0]
         if status == Status.CONTINUE:
             reward_info = self._get_reward(prev_state, self.vehicle.state)
@@ -251,17 +286,21 @@ class CarParking(gym.Env):
                 `CONTINUE`, `ARRIVED`, `COLLIDED`, `OUTBOUND`, `OUTTIME`
         `info` (`OrderedDict`): other information.
         '''
+        # 注意：该接口返回 (observation, reward_info, status, info)
+        # 与标准 Gym 的 reward/done 约定不同，Wrapper 会负责适配。
         assert self.vehicle is not None
         prev_state = self.vehicle.state
         collide = False
         arrive = False
         if action is not None:
+            # 一个外部 action 会在底层做 NUM_STEP 次微步仿真，提高动力学稳定性
             for simu_step_num in range(NUM_STEP):
                 prev_info = self.vehicle.step(action,step_time=1)
                 if self._check_arrived():
                     arrive = True
                     break
                 if self._detect_collision():
+                    # 碰撞时回退到上一个可行状态，避免轨迹穿透障碍
                     if simu_step_num == 0:
                         collide = ENV_COLLIDE
                         self.vehicle.retreat(prev_info)
@@ -274,6 +313,7 @@ class CarParking(gym.Env):
             if simu_step_num > 1:
                 del self.vehicle.trajectory[-simu_step_num:-1]
 
+        # 这里的 t 是环境“高层步”，不是 NUM_STEP 的微步计数
         self.t += 1
         observation = self.render(self.render_mode)
         if arrive:
@@ -290,6 +330,9 @@ class CarParking(gym.Env):
 
         info = OrderedDict({'reward_info':reward_info,
             'path_to_dest':None})
+
+        # 当靠近目标且仍在继续状态时，尝试求解一条无碰 RS 路径。
+        # 找到后交由上层 ParkingAgent 决定是否切换为规划器执行。
         if self.t > 1 and status==Status.CONTINUE\
             and self.vehicle.state.loc.distance(self.map.dest.loc)<RS_MAX_DIST:
             rs_path_to_dest = self.find_rs_path(status)
@@ -299,6 +342,7 @@ class CarParking(gym.Env):
         return observation, reward_info, status, info
 
     def _render(self, surface: pygame.Surface):
+        # 渲染顺序：背景 -> 障碍 -> 起终点 -> 车辆 -> 历史轨迹
         surface.fill(BG_COLOR)
         for obstacle in self.map.obstacles:
             pygame.draw.polygon(
@@ -320,6 +364,7 @@ class CarParking(gym.Env):
                     surface, TRAJ_COLORS[-(render_len-i)], self._coord_transform(vehicle_box))
 
     def _get_img_observation(self, surface: pygame.Surface):
+        # 以车辆朝向对全局画面做逆向旋转，再裁剪 ego-centered 观测窗
         angle = self.vehicle.state.heading
         old_center = surface.get_rect().center
 
@@ -334,7 +379,7 @@ class CarParking(gym.Env):
         dy = -(vehicle_center[0]-old_center[0])*np.sin(angle) \
             + (vehicle_center[1]-old_center[1])*np.cos(angle)
         
-        # align the center of the observation with the center of the vehicle
+        # 将车辆中心对齐到观测图像中心，得到稳定的自车视角
         observation = pygame.Surface((WIN_W, WIN_H))
     
         observation.fill(BG_COLOR)
@@ -365,12 +410,15 @@ class CarParking(gym.Env):
         return processed_img
 
     def _get_lidar_observation(self,):
+        # 基于当前障碍轮廓做激光扫描
         obs_list = [obs.shape for obs in self.map.obstacles]
         lidar_view = self.lidar.get_observation(self.vehicle.state, obs_list)
         return lidar_view
     
     def _get_targt_repr(self,):
-        # target position representation
+        # 目标表示向量：
+        # [距离, 相对方位角 cos/sin, 目标朝向相对角 cos/sin]
+        # 用 sin/cos 编码角度可避免角度在 +/-pi 处不连续。
         dest_pos = (self.map.dest.loc.x, self.map.dest.loc.y, self.map.dest.heading)
         ego_pos = (self.vehicle.state.loc.x, self.vehicle.state.loc.y, self.vehicle.state.heading)
         rel_distance = math.sqrt((dest_pos[0]-ego_pos[0])**2 + (dest_pos[1]-ego_pos[1])**2)
@@ -396,6 +444,7 @@ class CarParking(gym.Env):
             self.clock = pygame.time.Clock()
 
         self._render(self.screen)
+        # 固定输出字段，方便上层模型按键取值
         observation = {'img':None, 'lidar':None, 'target':None, 'action_mask':None}
         if self.use_img_observation:
             raw_observation = self._get_img_observation(self.screen)
@@ -420,19 +469,20 @@ class CarParking(gym.Env):
         startX, startY, startYaw = self.vehicle.state.loc.x, self.vehicle.state.loc.y, self.vehicle.state.heading
         goalX, goalY, goalYaw = self.map.dest.loc.x, self.map.dest.loc.y, self.map.dest.heading
         radius = math.tan(VALID_STEER[-1])/WHEEL_BASE
-        #  Find all possible reeds-shepp paths between current and goal node
+        # 1) 枚举所有 RS 候选路径
         reedsSheppPaths = rsCurve.calc_all_paths(startX, startY, startYaw, goalX, goalY, goalYaw, radius, 0.1)
 
         # Check if reedsSheppPaths is empty
         if not reedsSheppPaths:
             return None
 
-        # Find path with lowest cost considering non-holonomic constraints
+        # 2) 以路径长度为代价放入优先队列（短路径优先）
         costQueue = heapdict()
         for path in reedsSheppPaths:
             costQueue[path] = path.L
 
-        # Find first path in priority queue that is collision free
+        # 3) 从短到长检查碰撞，返回第一条可行路径
+        #    额外约束：当长度超过最短路径 1.6 倍且已检查若干条后提前停止
         min_path_len = -1
         idx = 0
         while len(costQueue)!=0:
@@ -450,6 +500,9 @@ class CarParking(gym.Env):
         return None
     
     def is_traj_valid(self, traj):
+        # 向量化碰撞检测：
+        # 将“每帧车辆四条边”与“附近障碍所有边”统一转为线段相交检测。
+        # 这样可避免逐帧逐边 Python 循环，提高 RS 轨迹验证速度。
         car_coords1 = np.array(VehicleBox.coords)[:4] # (4,2)
         car_coords2 = np.array(VehicleBox.coords)[1:] # (4,2)
         car_coords_x1 = car_coords1[:,0].reshape(1,-1)
@@ -458,7 +511,7 @@ class CarParking(gym.Env):
         car_coords_y2 = car_coords2[:,1].reshape(1,-1) # (1,4)
         vxs = np.array([t[0] for t in traj])
         vys = np.array([t[1] for t in traj])
-        # check outbound
+        # 先做边界盒快速拒绝，越界直接失败
         if np.min(vxs) < self.map.xmin or np.max(vxs) > self.map.xmax \
         or np.min(vys) < self.map.ymin or np.max(vys) > self.map.ymax:
             return False
@@ -478,6 +531,7 @@ class CarParking(gym.Env):
         b = (vx1s - vx2s).reshape(-1,1)
         c = (vy1s*vx2s - vx1s*vy2s).reshape(-1,1)
         
+        # 仅收集车辆轨迹包围盒附近障碍，减少无关计算
         # convert obstacles(LinerRing) to edges ((x1,y1), (x2,y2))
         x_max = np.max(vx1s) + 5
         x_min = np.min(vx1s) - 5
@@ -505,7 +559,8 @@ class CarParking(gym.Env):
         e = (x1s - x2s).reshape(1,-1)
         f = (y1s*x2s - x1s*y2s).reshape(1,-1)
 
-        # calculate the intersections
+        # 线段相交核心：解两直线交点，再过滤“不在线段范围内”的假交点
+        # 若任一有效交点存在，则判定轨迹碰撞。
         det = a*e - b*d # (4, E)
         parallel_line_pos = (det==0) # (4, E)
         det[parallel_line_pos] = 1 # temporarily set "1" to avoid "divided by zero"

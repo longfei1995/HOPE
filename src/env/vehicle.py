@@ -80,10 +80,8 @@ class KSModel(object):
         new_state = copy.deepcopy(state)
         x, y = new_state.loc.x, new_state.loc.y
         steer, speed = action
-        new_state.steering = steer
-        new_state.speed = speed
-        new_state.speed = np.clip(new_state.speed, *self.speed_range)
-        new_state.steering = np.clip(new_state.steering, *self.angle_range)
+        new_state.steering = np.clip(steer, self.angle_range[0], self.angle_range[1])
+        new_state.speed = np.clip(speed, self.speed_range[0], self.speed_range[1])
 
         for _ in range(step_time):
             for _ in range(self.mini_iter):
@@ -112,7 +110,7 @@ class Vehicle:
         self.state: State = None
         self.box: LinearRing = None
         self.trajectory: List[State] = []
-        self.kinetic_model: Callable = \
+        self.kinetic_model: KSModel = \
             KSModel(wheel_base, step_len, n_step, speed_range, angle_range)
         self.color = COLOR_POOL[0]
         self.v_max = None
@@ -138,6 +136,7 @@ class Vehicle:
         Args:
             action (list): [steer, speed]
         """
+        # prev_info 用于记录当前状态，以便在需要时进行回退（如碰撞后）
         prev_info = copy.deepcopy((self.state, self.box, self.v_max, self.v_min))
         self.state = self.kinetic_model.step(self.state, action, step_time)
         self.box = self.state.create_box()
